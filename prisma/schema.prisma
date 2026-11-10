@@ -1,0 +1,220 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "mysql"
+}
+
+// The order state machine (§6.7). Allowed moves are in src/orders/states.ts.
+enum OrderStatus {
+  PENDING_PAYMENT
+  CONFIRMED
+  PREPARING
+  PACKED
+  SHIPPED
+  OUT_FOR_DELIVERY
+  DELIVERED
+  CANCELLED
+  REFUND_PENDING
+  REFUNDED
+  RETURN_REQUESTED
+  RETURNED
+  RTO
+}
+
+enum PaymentMethod {
+  prepaid
+  cod
+}
+
+enum ItemKind {
+  sku
+  bundle
+}
+
+enum NoteKind {
+  internal
+  system
+}
+
+// Everything about a purchase is copied onto the order when it is placed
+// (names, prices, tax rates, address), so later catalog edits never change a
+// past order (§3). Money is integer paise; prices include GST.
+model Order {
+  id                    String        @id @db.Char(36)
+  // TEJ-26-000123: what the customer and the owner talk about.
+  orderNumber           String        @unique @db.VarChar(20)
+  userId                String?       @db.VarChar(64)
+  contactName           String        @db.VarChar(80)
+  contactEmail          String?       @db.VarChar(254)
+  contactPhone          String        @db.VarChar(15)
+  status                OrderStatus   @default(PENDING_PAYMENT)
+  paymentMethod         PaymentMethod
+  currency              String        @default("INR") @db.Char(3)
+  subtotalPaise         Int
+  discountPaise         Int
+  // Shipping charged, after any free-shipping discount.
+  shippingPaise         Int
+  shippingDiscountPaise Int           @default(0)
+  // GST included in the total (not added on top).
+  taxPaise              Int
+  totalPaise            Int
+  // { cgstPaise, sgstPaise, igstPaise, rates: [...] }
+  taxBreakup            Json
+  // GST state code of the delivery address; 37 (Andhra Pradesh) = CGST + SGST.
+  placeOfSupply         String        @db.Char(2)
+  couponCode            String?       @db.VarChar(40)
+  shippingAddress       Json
+  billingAddress        Json
+  // The key inventory holds this order's stock under (the order id, or a new
+  // key after a late payment re-reserved it).
+  reservationKey        String        @unique @db.VarChar(64)
+  // SHA-256 of the shopper + Idempotency-Key; the order id is derived from it.
+  idempotencyKey        String        @unique @db.Char(64)
+  // The cart it came from; ordered lines leave the cart once it's confirmed.
+  cartId                String?       @db.VarChar(64)
+  cartCleared           Boolean       @default(false)
+  paymentId             String?       @db.Char(36)
+  // Delivery instructions from the customer.
+  customerNote          String?       @db.VarChar(300)
+  placedAt              DateTime      @default(now())
+  confirmedAt           DateTime?
+  cancelledAt           DateTime?
+  cancelReason          String?       @db.VarChar(64)
+  createdAt             DateTime      @default(now())
+  updatedAt             DateTime      @updatedAt
+  version               Int           @default(1)
+
+  items   OrderItem[]
+  history OrderStatusHistory[]
+  notes   OrderNote[]
+
+  @@index([userId, placedAt])
+  @@index([status, placedAt])
+  @@index([placedAt])
+  @@index([contactPhone, paymentMethod, status])
+  @@index([contactEmail])
+}
+
+model OrderItem {
+  id               String   @id @default(uuid())
+  orderId          String   @db.Char(36)
+  kind             ItemKind
+  // SKU code (TURM-1KG) or combo slug.
+  ref              String   @db.VarChar(80)
+  // Catalog product or bundle id.
+  refId            String?  @db.VarChar(64)
+  name             String   @db.VarChar(160)
+  detail           String   @db.VarChar(80)
+  hsnCode          String?  @db.VarChar(8)
+  gstRateBp        Int
+  unitPaise        Int
+  mrpPaise         Int
+  qty              Int
+  discountPaise    Int
+  // unitPaise × qty − discountPaise: what the customer pays for this line.
+  lineTotalPaise   Int
+  taxPaise         Int
+  // What goes in the box: [{ productId, grams }] per unit.
+  components       Json
+  position         Int
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId])
+  @@index([refId])
+}
+
+model OrderStatusHistory {
+  id         String       @id @default(uuid())
+  orderId    String       @db.Char(36)
+  fromStatus OrderStatus?
+  toStatus   OrderStatus
+  // system, customer, or admin:<user id>
+  actor      String       @db.VarChar(80)
+  reason     String?      @db.VarChar(300)
+  at         DateTime     @default(now()) @db.DateTime(3)
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId, at])
+}
+
+// The owner's private notes, and things the system wants on the timeline
+// (a failed payment attempt, an amount mismatch).
+model OrderNote {
+  id      String   @id @default(uuid())
+  orderId String   @db.Char(36)
+  kind    NoteKind
+  actorId String?  @db.VarChar(64)
+  body    String   @db.VarChar(1000)
+  at      DateTime @default(now()) @db.DateTime(3)
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId, at])
+}
+
+// Last order number used each year (TEJ-26-000123).
+model OrderCounter {
+  year Int @id
+  last Int
+}
+
+// Every admin write (§10).
+model AuditLog {
+  id      String   @id @default(uuid())
+  actorId String?
+  action  String   @db.VarChar(64)
+  target  String?
+  at      DateTime @default(now())
+  meta    Json?
+
+  @@index([target])
+  @@index([at])
+}
+
+enum DeliveryStatus {
+  pending
+  delivered
+  failed
+}
+
+// Transactional outbox (§8), written in the same transaction as the change it describes.
+model OutboxEvent {
+  id            String   @id @db.Char(36)
+  type          String   @db.VarChar(64)
+  version       Int
+  payload       Json
+  correlationId String?  @db.VarChar(128)
+  createdAt     DateTime @default(now()) @db.DateTime(3)
+
+  deliveries OutboxDelivery[]
+
+  @@index([createdAt])
+}
+
+// One row per consumer, so a slow or broken consumer never holds up the others.
+model OutboxDelivery {
+  eventId       String         @db.Char(36)
+  consumer      String         @db.VarChar(64)
+  status        DeliveryStatus @default(pending)
+  attempts      Int            @default(0)
+  nextAttemptAt DateTime       @default(now()) @db.DateTime(3)
+  lastError     String?        @db.VarChar(500)
+  deliveredAt   DateTime?      @db.DateTime(3)
+
+  event OutboxEvent @relation(fields: [eventId], references: [id], onDelete: Cascade)
+
+  @@id([eventId, consumer])
+  @@index([status, nextAttemptAt])
+}
+
+// Inbox: events this service has already handled.
+model ProcessedEvent {
+  eventId     String   @id @db.Char(36)
+  type        String   @db.VarChar(64)
+  processedAt DateTime @default(now()) @db.DateTime(3)
+}

@@ -1,0 +1,68 @@
+# order-service with its own database.
+#   docker network create tej-net        # once per machine, shared by all services
+#   docker compose up --build
+# Service: http://localhost:4006 (the store reaches it through the api-gateway).
+# Checkout calls auth, cart, catalog, inventory, promotion, shipping and
+# payment over tej-net, so start those too.
+#
+# For hot reload, run only the database here and the service on your machine:
+#   docker compose up mysql
+#   pnpm dev
+name: tej-order
+
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./mysql/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    ports:
+      - "3313:3306" # 3313 on the host; auth 3307, catalog 3308, inventory 3309, cart 3310, promotion 3311, shipping 3312, payment 3314
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -uroot -p$$MYSQL_ROOT_PASSWORD"]
+      interval: 5s
+      retries: 20
+    restart: unless-stopped
+
+  order-service:
+    build: .
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      NODE_ENV: development
+      DB_HOST: mysql
+      DB_PORT: "3306"
+      MYSQL_USER: order
+      MYSQL_PASSWORD: order
+      MYSQL_DATABASE: order
+      AUTH_JWKS_URL: http://auth-service:4001/internal/.well-known/jwks.json
+      AUTH_URL: http://auth-service:4001
+      CART_URL: http://cart-service:4004
+      CATALOG_URL: http://catalog-service:4002
+      INVENTORY_URL: http://inventory-service:4003
+      PROMOTION_URL: http://promotion-service:4005
+      SHIPPING_URL: http://shipping-service:4008
+      PAYMENT_URL: http://payment-service:4007
+      INVENTORY_EVENTS_URL: http://inventory-service:4003/internal/events
+      PROMOTION_EVENTS_URL: http://promotion-service:4005/internal/events
+      PAYMENT_EVENTS_URL: http://payment-service:4007/internal/events
+      EVENT_RETRY_DELAYS: "5,15,30,60"
+    ports:
+      - "4006:4006"
+    networks:
+      - default
+      - tej-net # the api-gateway and other services reach it here as http://order-service:4006
+    depends_on:
+      mysql:
+        condition: service_healthy
+    restart: unless-stopped
+
+networks:
+  tej-net:
+    external: true
+
+volumes:
+  mysql-data:
